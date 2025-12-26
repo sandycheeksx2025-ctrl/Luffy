@@ -6,7 +6,7 @@ Change models here to update them everywhere.
 """
 
 # LLM Models (for text generation)
-LLM_MODEL = "tngtech/tng-r1t-chimera:free"
+LLM_MODEL = "xiaomi/mimo-v2-flash:free"
 
 
 # Image Models (for image generation)
