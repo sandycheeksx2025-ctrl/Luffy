@@ -6,7 +6,7 @@ Change models here to update them everywhere.
 """
 
 # LLM Models (for text generation)
-LLM_MODEL = "xiaomi/mimo-v2-flash:free"
+LLM_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 
 
 # Image Models (for image generation)
