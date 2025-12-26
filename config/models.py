@@ -6,7 +6,7 @@ Change models here to update them everywhere.
 """
 
 # LLM Models (for text generation)
-LLM_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+LLM_MODEL = "qwen/qwen3-coder:free"
 
 
 # Image Models (for image generation)
