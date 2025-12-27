@@ -6,7 +6,7 @@ Change models here to update them everywhere.
 """
 
 # LLM Models (for text generation)
-LLM_MODEL = "qwen/qwen3-coder:free"
+LLM_MODEL = "tngtech/tng-r1t-chimera:free"
 
 
 # Image Models (for image generation)
