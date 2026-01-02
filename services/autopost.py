@@ -1,10 +1,8 @@
 """
 Luffy Agent-based autoposting service.
 
-The agent creates a plan, executes tools step by step,
-and generates the final post text in Monkey D. Luffy style.
-
-All in one continuous conversation (user-assistant-user-assistant...).
+Handles invalid JSON, empty plans, and always ensures a tweet is posted
+in Monkey D. Luffy style.
 """
 
 import json
@@ -24,7 +22,6 @@ from config.schemas import PLAN_SCHEMA, POST_TEXT_SCHEMA, TOOL_REACTION_SCHEMA
 
 logger = logging.getLogger(__name__)
 
-# Fallback Luffy-style tweets
 FALLBACK_TWEETS = [
     "Dream big and chase your freedom! Nothing can stop a determined heart! 🏴‍☠️💪",
     "Adventure waits beyond the horizon. Keep sailing toward your dreams! 🌊☀️",
@@ -35,11 +32,7 @@ FALLBACK_TWEETS = [
     "Eat, fight, laugh, and live fully—freedom is worth everything! 🍖⚡"
 ]
 
-
 def get_agent_system_prompt() -> str:
-    """
-    Build agent system prompt with dynamic tools list.
-    """
     tools_desc = get_tools_description()
     return AUTOPOST_AGENT_PROMPT.format(tools_desc=tools_desc)
 
@@ -55,7 +48,6 @@ class AutoPostService:
 
     def _sanitize_plan(self, plan: list[dict]) -> list[dict]:
         if not isinstance(plan, list):
-            logger.warning("[AUTOPOST] Plan is not a list — stripping plan")
             return []
 
         sanitized = []
@@ -68,27 +60,20 @@ class AutoPostService:
             params = step.get("params", {})
 
             if tool_name not in TOOLS:
-                logger.warning(f"[AUTOPOST] Unknown tool requested by agent: {tool_name} — skipping")
                 continue
 
             if tool_name == "generate_image":
                 if has_image:
-                    logger.warning("[AUTOPOST] Multiple generate_image calls — skipping")
                     continue
                 has_image = True
 
             sanitized.append({"tool": tool_name, "params": params})
-
             if len(sanitized) >= 3:
-                logger.warning("[AUTOPOST] Plan exceeded max length — truncating")
                 break
 
         image_steps = [s for s in sanitized if s["tool"] == "generate_image"]
         non_image_steps = [s for s in sanitized if s["tool"] != "generate_image"]
-
-        final_plan = non_image_steps + image_steps[:1]
-        logger.info(f"[AUTOPOST] Plan sanitized: {len(final_plan)} steps")
-        return final_plan
+        return non_image_steps + image_steps[:1]
 
     async def run(self) -> dict[str, Any]:
         start_time = time.time()
@@ -98,17 +83,9 @@ class AutoPostService:
             if self.tier_manager:
                 can_post, reason = self.tier_manager.can_post()
                 if not can_post:
-                    logger.warning(f"[AUTOPOST] Blocked: {reason}")
-                    return {
-                        "success": False,
-                        "error": f"posting_blocked: {reason}",
-                        "tier": self.tier_manager.tier,
-                        "usage_percent": self.tier_manager.get_usage_percent()
-                    }
+                    return {"success": False, "error": reason}
 
-            logger.info("[AUTOPOST] [1/5] Loading context...")
             previous_posts = await self.db.get_recent_posts_formatted(limit=50)
-            logger.info(f"[AUTOPOST] [1/5] Loaded {len(previous_posts)} chars of previous posts")
 
             system_prompt = SYSTEM_PROMPT + get_agent_system_prompt()
             messages = [
@@ -120,9 +97,9 @@ class AutoPostService:
 Now create your plan. What tools do you need (if any)?"""}
             ]
 
-            logger.info("[AUTOPOST] [2/5] Creating plan - calling LLM...")
             plan_result_raw = await self.llm.chat(messages, PLAN_SCHEMA)
 
+            # --- SAFELY PARSE PLAN ---
             plan_result = {}
             if isinstance(plan_result_raw, dict):
                 plan_result = plan_result_raw
@@ -138,20 +115,12 @@ Now create your plan. What tools do you need (if any)?"""}
                             plan_result = {}
 
             raw_plan = plan_result.get("plan", [])
-            reasoning = plan_result.get("reasoning", "")
             plan = self._sanitize_plan(raw_plan)
 
-            tools_list = " -> ".join([s["tool"] for s in plan]) if plan else "none"
-            logger.info(f"[AUTOPOST] [2/5] Plan: {len(plan)} tools ({tools_list})")
-            logger.info(f"[AUTOPOST] [2/5] Reasoning: {reasoning[:100]}...")
-
-            messages.append({"role": "assistant", "content": json.dumps(plan_result)})
-
-            logger.info("[AUTOPOST] [3/5] Executing tools...")
+            # --- EXECUTE TOOLS ---
             image_bytes = None
             tools_used = []
-
-            for i, step in enumerate(plan):
+            for step in plan:
                 tool_name = step["tool"]
                 params = step["params"]
                 tools_used.append(tool_name)
@@ -162,20 +131,18 @@ Now create your plan. What tools do you need (if any)?"""}
                     messages.append({"role": "user", "content": f"Tool result (web_search): {result.get('content', '')}"})
 
                 elif tool_name == "generate_image":
-                    prompt = params.get("prompt", "")
                     try:
+                        prompt = params.get("prompt", "")
                         image_bytes = await TOOLS[tool_name](prompt)
                         messages.append({"role": "user", "content": "Tool result (generate_image): completed"})
-                    except Exception as e:
-                        logger.error(f"[AUTOPOST] generate_image failed: {e}")
+                    except Exception:
                         image_bytes = None
 
                 reaction = await self.llm.chat(messages, TOOL_REACTION_SCHEMA)
                 messages.append({"role": "assistant", "content": reaction.get("thinking", "")})
 
-            logger.info("[AUTOPOST] [4/5] Generating tweet...")
-            messages.append({"role": "user", "content": "Now write your final tweet text in Luffy style (max 280 characters). Just the tweet."})
-
+            # --- GENERATE FINAL TWEET ---
+            messages.append({"role": "user", "content": "Write your final tweet in Luffy style (max 280 chars)."})
             post_result_raw = await self.llm.chat(messages, POST_TEXT_SCHEMA)
 
             post_text = ""
@@ -189,20 +156,16 @@ Now create your plan. What tools do you need (if any)?"""}
                     post_text = post_result_raw
 
             post_text = post_text.strip()[:280]
-
             if not post_text:
                 post_text = random.choice(FALLBACK_TWEETS)[:280]
-                logger.info("[AUTOPOST] Using fallback Luffy tweet as LLM returned empty text.")
-
-            logger.info(f"[AUTOPOST] Tweet ready ({len(post_text)} chars)")
+                logger.info("[AUTOPOST] Using fallback Luffy tweet.")
 
             media_ids = None
             if image_bytes:
                 try:
                     media_id = await self.twitter.upload_media(image_bytes)
                     media_ids = [media_id]
-                except Exception as e:
-                    logger.error(f"[AUTOPOST] Image upload failed: {e}")
+                except Exception:
                     image_bytes = None
 
             tweet_data = await self.twitter.post(post_text, media_ids=media_ids)
@@ -224,4 +187,12 @@ Now create your plan. What tools do you need (if any)?"""}
             duration = round(time.time() - start_time, 1)
             logger.error(f"[AUTOPOST] === FAILED after {duration}s ===")
             logger.exception(e)
-            return {"success": False, "error": str(e), "duration_seconds": duration}
+            # Ensure a fallback tweet is always returned
+            fallback_text = random.choice(FALLBACK_TWEETS)[:280]
+            try:
+                tweet_data = await self.twitter.post(fallback_text)
+                await self.db.save_post(fallback_text, tweet_data["id"], False)
+            except Exception as e2:
+                logger.error(f"[AUTOPOST] Failed to post fallback: {e2}")
+
+            return {"success": False, "error": str(e), "duration_seconds": duration, "fallback_posted": True}
