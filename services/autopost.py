@@ -1,8 +1,8 @@
 """
 Luffy Agent-based autoposting service.
 
-Handles invalid JSON, empty plans, and always ensures a tweet is posted
-in Monkey D. Luffy style.
+Handles invalid JSON, empty plans, retries LLM requests, and always ensures
+a tweet is posted in Monkey D. Luffy style.
 """
 
 import json
@@ -32,6 +32,9 @@ FALLBACK_TWEETS = [
     "Eat, fight, laugh, and live fully—freedom is worth everything! 🍖⚡"
 ]
 
+MAX_RETRIES = 3
+RETRY_DELAY = 1.0  # seconds, will increase exponentially
+
 def get_agent_system_prompt() -> str:
     tools_desc = get_tools_description()
     return AUTOPOST_AGENT_PROMPT.format(tools_desc=tools_desc)
@@ -45,6 +48,22 @@ class AutoPostService:
         self.llm = LLMClient()
         self.twitter = TwitterClient()
         self.tier_manager = tier_manager
+
+    async def _llm_chat_retry(self, messages, schema) -> Any:
+        """Call LLM with retries on failure."""
+        attempt = 0
+        delay = RETRY_DELAY
+        while attempt < MAX_RETRIES:
+            try:
+                return await self.llm.chat(messages, schema)
+            except Exception as e:
+                attempt += 1
+                logger.warning(f"[LLM RETRY] Attempt {attempt}/{MAX_RETRIES} failed: {e}")
+                if attempt >= MAX_RETRIES:
+                    logger.error("[LLM RETRY] Max attempts reached. Raising exception.")
+                    raise
+                await asyncio.sleep(delay)
+                delay *= 2  # exponential backoff
 
     def _sanitize_plan(self, plan: list[dict]) -> list[dict]:
         if not isinstance(plan, list):
@@ -76,21 +95,14 @@ class AutoPostService:
         return non_image_steps + image_steps[:1]
 
     def _parse_json_safe(self, raw: str) -> dict:
-        """
-        Safely parse a string into JSON.
-        Handles code fences and extra text.
-        """
+        """Safely parse a string into JSON."""
         if not raw:
             return {}
 
-        # Strip code fences
         cleaned = re.sub(r"^```json|```$", "", raw, flags=re.MULTILINE).strip()
-
-        # Try parsing directly
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError:
-            # Extract first JSON object from string
             match = re.search(r"\{.*\}", cleaned, re.DOTALL)
             if match:
                 try:
@@ -99,7 +111,19 @@ class AutoPostService:
                     return {}
         return {}
 
+    def _extract_tweet(self, text: str) -> str:
+        """Extract tweet text from plain LLM output."""
+        if not text:
+            return ""
+        cleaned = re.sub(r"^```.*?```", "", text, flags=re.DOTALL).strip()
+        cleaned = re.sub(r"\*\*|__|\*|_", "", cleaned)
+        match = re.search(r'"(.*?)"', cleaned, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return cleaned.strip()
+
     async def run(self) -> dict[str, Any]:
+        import asyncio  # needed for retry sleep
         start_time = time.time()
         logger.info("[AUTOPOST] === Starting ===")
 
@@ -121,10 +145,9 @@ class AutoPostService:
 Now create your plan. What tools do you need (if any)?"""}
             ]
 
-            plan_result_raw = await self.llm.chat(messages, PLAN_SCHEMA)
+            plan_result_raw = await self._llm_chat_retry(messages, PLAN_SCHEMA)
             logger.debug(f"[AUTOPOST] Raw LLM plan response: {plan_result_raw}")
 
-            # --- SAFELY PARSE PLAN ---
             plan_result = plan_result_raw if isinstance(plan_result_raw, dict) else self._parse_json_safe(plan_result_raw)
             raw_plan = plan_result.get("plan", [])
             plan = self._sanitize_plan(raw_plan)
@@ -150,20 +173,20 @@ Now create your plan. What tools do you need (if any)?"""}
                     except Exception:
                         image_bytes = None
 
-                reaction_raw = await self.llm.chat(messages, TOOL_REACTION_SCHEMA)
+                reaction_raw = await self._llm_chat_retry(messages, TOOL_REACTION_SCHEMA)
                 reaction = reaction_raw if isinstance(reaction_raw, dict) else self._parse_json_safe(reaction_raw)
                 messages.append({"role": "assistant", "content": reaction.get("thinking", "")})
 
             # --- GENERATE FINAL TWEET ---
             messages.append({"role": "user", "content": "Write your final tweet in Luffy style (max 280 chars)."})
-            post_result_raw = await self.llm.chat(messages, POST_TEXT_SCHEMA)
+            post_result_raw = await self._llm_chat_retry(messages, POST_TEXT_SCHEMA)
 
             post_text = ""
             if isinstance(post_result_raw, dict):
                 post_text = post_result_raw.get("post_text") or post_result_raw.get("post") or ""
             elif isinstance(post_result_raw, str):
                 post_json = self._parse_json_safe(post_result_raw)
-                post_text = post_json.get("post_text") or post_json.get("post") or post_result_raw
+                post_text = post_json.get("post_text") or post_json.get("post") or self._extract_tweet(post_result_raw)
 
             post_text = post_text.strip()[:280]
             if not post_text:
@@ -198,7 +221,6 @@ Now create your plan. What tools do you need (if any)?"""}
             logger.error(f"[AUTOPOST] === FAILED after {duration}s ===")
             logger.exception(e)
 
-            # Ensure a fallback tweet is always returned
             fallback_text = random.choice(FALLBACK_TWEETS)[:280]
             try:
                 tweet_data = await self.twitter.post(fallback_text)
