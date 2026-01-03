@@ -75,6 +75,30 @@ class AutoPostService:
         non_image_steps = [s for s in sanitized if s["tool"] != "generate_image"]
         return non_image_steps + image_steps[:1]
 
+    def _parse_json_safe(self, raw: str) -> dict:
+        """
+        Safely parse a string into JSON.
+        Handles code fences and extra text.
+        """
+        if not raw:
+            return {}
+
+        # Strip code fences
+        cleaned = re.sub(r"^```json|```$", "", raw, flags=re.MULTILINE).strip()
+
+        # Try parsing directly
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            # Extract first JSON object from string
+            match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except Exception:
+                    return {}
+        return {}
+
     async def run(self) -> dict[str, Any]:
         start_time = time.time()
         logger.info("[AUTOPOST] === Starting ===")
@@ -86,8 +110,8 @@ class AutoPostService:
                     return {"success": False, "error": reason}
 
             previous_posts = await self.db.get_recent_posts_formatted(limit=50)
-
             system_prompt = SYSTEM_PROMPT + get_agent_system_prompt()
+
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"""Create a Twitter post in Monkey D. Luffy style. Previous posts (don't repeat):
@@ -98,22 +122,10 @@ Now create your plan. What tools do you need (if any)?"""}
             ]
 
             plan_result_raw = await self.llm.chat(messages, PLAN_SCHEMA)
+            logger.debug(f"[AUTOPOST] Raw LLM plan response: {plan_result_raw}")
 
             # --- SAFELY PARSE PLAN ---
-            plan_result = {}
-            if isinstance(plan_result_raw, dict):
-                plan_result = plan_result_raw
-            elif isinstance(plan_result_raw, str):
-                try:
-                    plan_result = json.loads(plan_result_raw)
-                except json.JSONDecodeError:
-                    match = re.search(r"\{.*\}", plan_result_raw, re.DOTALL)
-                    if match:
-                        try:
-                            plan_result = json.loads(match.group())
-                        except Exception:
-                            plan_result = {}
-
+            plan_result = plan_result_raw if isinstance(plan_result_raw, dict) else self._parse_json_safe(plan_result_raw)
             raw_plan = plan_result.get("plan", [])
             plan = self._sanitize_plan(raw_plan)
 
@@ -138,7 +150,8 @@ Now create your plan. What tools do you need (if any)?"""}
                     except Exception:
                         image_bytes = None
 
-                reaction = await self.llm.chat(messages, TOOL_REACTION_SCHEMA)
+                reaction_raw = await self.llm.chat(messages, TOOL_REACTION_SCHEMA)
+                reaction = reaction_raw if isinstance(reaction_raw, dict) else self._parse_json_safe(reaction_raw)
                 messages.append({"role": "assistant", "content": reaction.get("thinking", "")})
 
             # --- GENERATE FINAL TWEET ---
@@ -149,11 +162,8 @@ Now create your plan. What tools do you need (if any)?"""}
             if isinstance(post_result_raw, dict):
                 post_text = post_result_raw.get("post_text") or post_result_raw.get("post") or ""
             elif isinstance(post_result_raw, str):
-                try:
-                    post_json = json.loads(post_result_raw)
-                    post_text = post_json.get("post_text") or post_json.get("post") or post_result_raw
-                except json.JSONDecodeError:
-                    post_text = post_result_raw
+                post_json = self._parse_json_safe(post_result_raw)
+                post_text = post_json.get("post_text") or post_json.get("post") or post_result_raw
 
             post_text = post_text.strip()[:280]
             if not post_text:
@@ -187,6 +197,7 @@ Now create your plan. What tools do you need (if any)?"""}
             duration = round(time.time() - start_time, 1)
             logger.error(f"[AUTOPOST] === FAILED after {duration}s ===")
             logger.exception(e)
+
             # Ensure a fallback tweet is always returned
             fallback_text = random.choice(FALLBACK_TWEETS)[:280]
             try:
